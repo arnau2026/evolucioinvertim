@@ -9,11 +9,8 @@ import streamlit as st
 import yfinance as yf
 
 FILE = Path(__file__).with_name("USAstocks.xlsx")
-SP500 = "SPY"
-NASDAQ100 = "QQQ"
-HEDGE_TICKER = "QQQ"
+BENCHMARK = "SPY"
 DEFAULT_INITIAL_CAPITAL = 100_000.0
-DEFAULT_HEDGE_MULTIPLIER = 2.5
 CURRENCY = "$"
 TZ = ZoneInfo("Europe/Madrid")
 QUICK_PERIODS = {
@@ -43,7 +40,7 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-:root{color-scheme:light!important}
+:root {color-scheme:light!important}
 html,body,[data-testid="stAppViewContainer"],.stApp{background:#fff!important;color:#172033!important}
 [data-testid="stSidebar"],[data-testid="collapsedControl"]{display:none!important}
 .block-container{padding-top:1.2rem;padding-bottom:2.5rem;max-width:1450px}
@@ -58,8 +55,12 @@ div[role="radiogroup"] label:has(input:checked){background:#143d59!important;bor
 div[role="radiogroup"] label:has(input:checked) p,div[role="radiogroup"] label:has(input:checked) span{color:#fff!important;font-weight:800!important}
 .section{font-size:.82rem;color:#64748b;text-transform:uppercase;letter-spacing:.08em;font-weight:750;margin:.8rem 0 .55rem}
 .month-label{color:#64748b;font-size:.82rem;font-weight:750;margin:.15rem 0 .25rem}
-.small-note{color:#64748b;font-size:.82rem}
-@media(max-width:768px){.block-container{padding:1rem .75rem 2rem!important}h1{font-size:2rem!important;line-height:1.15!important}div[role="radiogroup"]{gap:.25rem!important}div[role="radiogroup"] label{min-width:48px!important;padding:.28rem .42rem!important}div[role="radiogroup"] label p{font-size:.82rem!important}}
+@media(max-width:768px){
+.block-container{padding:1rem .75rem 2rem!important}h1{font-size:2rem!important;line-height:1.15!important}
+div[role="radiogroup"]{gap:.25rem!important}
+div[role="radiogroup"] label{min-width:48px!important;padding:.28rem .42rem!important}
+div[role="radiogroup"] label p{font-size:.82rem!important}
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -69,11 +70,9 @@ div[role="radiogroup"] label:has(input:checked) p,div[role="radiogroup"] label:h
 def load_trades(path):
     df = pd.read_excel(path, engine="openpyxl")
     df.columns = [str(column).strip().upper() for column in df.columns]
-    required = {"TICKER", "BUY DATE", "SELL DATE"}
-    missing = required - set(df.columns)
+    missing = {"TICKER", "BUY DATE", "SELL DATE"} - set(df.columns)
     if missing:
         raise ValueError("Faltan columnas: " + ", ".join(sorted(missing)))
-
     df["TICKER"] = df["TICKER"].astype(str).str.strip().str.upper().str.replace(".", "-", regex=False)
     df["TICKER"] = df["TICKER"].replace({"SATS": "ECHO"})
     df["BUY DATE"] = pd.to_datetime(df["BUY DATE"], errors="coerce").dt.normalize()
@@ -81,8 +80,7 @@ def load_trades(path):
     df = df[df["BUY DATE"].notna() & df["TICKER"].ne("")].copy()
     if df.empty:
         raise ValueError("El Excel no contiene operaciones válidas.")
-    invalid = df["SELL DATE"].notna() & (df["SELL DATE"] < df["BUY DATE"])
-    if invalid.any():
+    if (df["SELL DATE"].notna() & (df["SELL DATE"] < df["BUY DATE"])).any():
         raise ValueError("Hay alguna fecha de venta anterior a la compra.")
     df["TRADE ID"] = np.arange(len(df))
     return df.sort_values(["BUY DATE", "TICKER"]).reset_index(drop=True)
@@ -111,7 +109,7 @@ def next_session(date, sessions):
     return candidates[0] if len(candidates) else pd.NaT
 
 
-def build_long_portfolio(trades, prices, initial_capital):
+def build_money_portfolio(trades, prices, initial_capital):
     sessions = prices.index
     events = trades.copy()
     events["BUY SESSION"] = events["BUY DATE"].map(lambda value: next_session(value, sessions))
@@ -193,40 +191,9 @@ def build_long_portfolio(trades, prices, initial_capital):
     return portfolio, ledger_df
 
 
-def build_hedge(long_equity, prices, hedge_date, multiplier):
-    """Abre una cobertura corta fija en QQQ y no la rebalancea después."""
-    hedge_session = next_session(hedge_date, prices.index)
-    if pd.isna(hedge_session) or hedge_session not in long_equity.index:
-        raise ValueError("No se puede determinar la sesión de apertura de la cobertura.")
-
-    base_value = float(long_equity.loc[hedge_session])
-    entry_price = float(prices.loc[hedge_session, HEDGE_TICKER])
-    notional = base_value * float(multiplier)
-    short_shares = notional / entry_price
-
-    qqq = prices[HEDGE_TICKER].reindex(long_equity.index).ffill()
-    hedge_pnl = pd.Series(0.0, index=long_equity.index)
-    active = hedge_pnl.index >= hedge_session
-    hedge_pnl.loc[active] = (entry_price - qqq.loc[active]) * short_shares
-    hedged_equity = long_equity + hedge_pnl
-
-    details = {
-        "session": hedge_session,
-        "base_value": base_value,
-        "entry_price": entry_price,
-        "notional": notional,
-        "short_shares": short_shares,
-        "current_price": float(qqq.iloc[-1]),
-        "current_liability": float(short_shares * qqq.iloc[-1]),
-        "pnl": float(hedge_pnl.iloc[-1]),
-        "return": float(hedge_pnl.iloc[-1] / notional) if notional else np.nan,
-    }
-    return hedged_equity.rename("Cartera con cobertura"), hedge_pnl, details
-
-
-def build_buy_hold(prices, ticker, start_date, capital):
-    series = prices[ticker].dropna().loc[start_date:]
-    return series * (capital / series.iloc[0])
+def build_benchmark(prices, start_date, initial_capital):
+    benchmark = prices[BENCHMARK].dropna().loc[start_date:]
+    return benchmark * (initial_capital / benchmark.iloc[0])
 
 
 def quick_range(period, today):
@@ -242,10 +209,10 @@ def month_range(month_number, year, today):
 
 
 def select_period(values, start, end):
-    chosen = values.loc[(values.index >= start) & (values.index <= end)].copy()
-    if chosen.empty:
+    selected = values.loc[(values.index >= start) & (values.index <= end)].copy()
+    if selected.empty:
         raise ValueError("No hay sesiones disponibles para el periodo seleccionado.")
-    return chosen
+    return selected
 
 
 def calculate_stats(values):
@@ -260,25 +227,8 @@ def calculate_stats(values):
     }
 
 
-def beta_alpha(asset_values, benchmark_values):
-    aligned = pd.concat([asset_values, benchmark_values], axis=1).dropna()
-    returns = aligned.pct_change(fill_method=None).dropna()
-    if len(returns) < 3 or returns.iloc[:, 1].var() == 0:
-        return np.nan, np.nan
-    asset_return = returns.iloc[:, 0]
-    benchmark_return = returns.iloc[:, 1]
-    beta = asset_return.cov(benchmark_return) / benchmark_return.var()
-    alpha_daily = (asset_return - beta * benchmark_return).mean()
-    alpha_annual = (1 + alpha_daily) ** 252 - 1
-    return beta, alpha_annual
-
-
 def pct(value):
     return "N/D" if pd.isna(value) else f"{value:+.2%}"
-
-
-def beta_text(value):
-    return "N/D" if pd.isna(value) else f"{value:.2f}"
 
 
 def ratio(value):
@@ -326,7 +276,7 @@ if "month_choice" not in st.session_state:
     st.session_state.month_choice = None
 
 st.title("Rentabilidad de la cartera")
-capital_col, hedge_col, selector_col, refresh_col = st.columns([2.0, 1.7, 4.8, 1.5], vertical_alignment="bottom")
+capital_col, selector_col, refresh_col = st.columns([2.2, 5.8, 1.5], vertical_alignment="bottom")
 with capital_col:
     initial_capital = st.number_input(
         "Capital inicial a 1 de enero",
@@ -335,20 +285,15 @@ with capital_col:
         step=10_000.0,
         format="%.0f",
     )
-with hedge_col:
-    hedge_multiplier = st.number_input(
-        "Multiplicador cobertura",
-        min_value=0.0,
-        value=DEFAULT_HEDGE_MULTIPLIER,
-        step=0.1,
-        format="%.2f",
-        help="Notional corto en QQQ = valor de mercado de la cartera el día de apertura × multiplicador.",
-    )
 with selector_col:
     st.radio(
-        "Periodo rápido", ["1S", "1M", "3M", "6M", "YTD"],
-        index=None, key="quick_choice", horizontal=True,
-        label_visibility="collapsed", on_change=choose_quick,
+        "Periodo rápido",
+        ["1S", "1M", "3M", "6M", "YTD"],
+        index=None,
+        key="quick_choice",
+        horizontal=True,
+        label_visibility="collapsed",
+        on_change=choose_quick,
     )
 with refresh_col:
     if st.button("↻ Actualizar", type="primary", width="stretch"):
@@ -357,8 +302,13 @@ with refresh_col:
 
 st.markdown('<div class="month-label">Seleccionar mes</div>', unsafe_allow_html=True)
 st.radio(
-    "Mes", list(MONTHS.keys()), index=None, key="month_choice",
-    horizontal=True, label_visibility="collapsed", on_change=choose_month,
+    "Mes",
+    list(MONTHS.keys()),
+    index=None,
+    key="month_choice",
+    horizontal=True,
+    label_visibility="collapsed",
+    on_change=choose_month,
 )
 
 if not FILE.exists():
@@ -366,37 +316,28 @@ if not FILE.exists():
     st.stop()
 
 try:
-    all_rows = load_trades(FILE)
-    hedge_rows = all_rows[all_rows["TICKER"] == HEDGE_TICKER].copy()
-    long_trades = all_rows[all_rows["TICKER"] != HEDGE_TICKER].copy()
-    if hedge_rows.empty:
-        raise ValueError("No encuentro la fila de cobertura QQQ en el Excel.")
-    hedge_row = hedge_rows.iloc[-1]
-    hedge_date = pd.Timestamp(hedge_row["BUY DATE"])
-
-    tickers = tuple(sorted(set(long_trades["TICKER"]) | {SP500, NASDAQ100}))
+    trades = load_trades(FILE)
+    tickers = tuple(sorted(set(trades["TICKER"]) | {BENCHMARK}))
     prices = get_prices(
         tickers,
-        (all_rows["BUY DATE"].min() - pd.Timedelta(days=10)).strftime("%Y-%m-%d"),
+        (trades["BUY DATE"].min() - pd.Timedelta(days=10)).strftime("%Y-%m-%d"),
         (today + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
     )
-    if prices.empty or SP500 not in prices.columns or NASDAQ100 not in prices.columns:
-        st.error("No se han podido descargar los precios de SPY o QQQ.")
+    if prices.empty or BENCHMARK not in prices.columns:
+        st.error("No se han podido descargar los precios.")
         st.stop()
 
-    missing = sorted(set(long_trades["TICKER"]) - set(prices.columns))
+    missing = sorted(set(trades["TICKER"]) - set(prices.columns))
     if missing:
         st.warning("Sin precios para: " + ", ".join(missing))
-        long_trades = long_trades[~long_trades["TICKER"].isin(missing)].copy()
+        trades = trades[~trades["TICKER"].isin(missing)].copy()
 
-    portfolio, ledger = build_long_portfolio(long_trades, prices, initial_capital)
-    long_equity = portfolio["Patrimonio"].rename("Cartera sin cobertura")
-    hedged_equity, hedge_pnl, hedge_details = build_hedge(
-        long_equity, prices, hedge_date, hedge_multiplier
-    )
-    spy_equity = build_buy_hold(prices, SP500, portfolio.index[0], initial_capital).rename("S&P 500")
-    qqq_equity = build_buy_hold(prices, NASDAQ100, portfolio.index[0], initial_capital).rename("Nasdaq 100")
-    equity = pd.concat([long_equity, hedged_equity, spy_equity, qqq_equity], axis=1).ffill().dropna()
+    portfolio, ledger = build_money_portfolio(trades, prices, initial_capital)
+    benchmark = build_benchmark(prices, portfolio.index[0], initial_capital)
+    equity = pd.concat([
+        portfolio["Patrimonio"].rename("Cartera"),
+        benchmark.rename("S&P 500"),
+    ], axis=1).ffill().dropna()
 
     if st.session_state.active_selector == "month" and st.session_state.month_choice:
         month_number = MONTHS[st.session_state.month_choice]
@@ -408,155 +349,93 @@ try:
         period_label = quick
 
     selected = select_period(equity, start, end)
-    long_stats = calculate_stats(selected["Cartera sin cobertura"])
-    hedge_stats = calculate_stats(selected["Cartera con cobertura"])
-    spy_stats = calculate_stats(selected["S&P 500"])
+    portfolio_stats = calculate_stats(selected["Cartera"])
+    benchmark_stats = calculate_stats(selected["S&P 500"])
     drawdown = selected / selected.cummax() - 1
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=selected.index, y=selected["Cartera sin cobertura"],
-        name="Cartera sin cobertura", mode="lines",
+        x=selected.index, y=selected["Cartera"], name="Cartera", mode="lines",
         line=dict(color="#087f8c", width=3),
-        hovertemplate=f"%{{x|%d/%m/%Y}}<br><b>{CURRENCY}%{{y:,.0f}}</b><extra>Sin cobertura</extra>",
-    ))
-    fig.add_trace(go.Scatter(
-        x=selected.index, y=selected["Cartera con cobertura"],
-        name=f"Cartera con cobertura ×{hedge_multiplier:g}", mode="lines",
-        line=dict(color="#8b1e3f", width=3),
-        hovertemplate=f"%{{x|%d/%m/%Y}}<br><b>{CURRENCY}%{{y:,.0f}}</b><extra>Con cobertura</extra>",
+        hovertemplate=f"%{{x|%d/%m/%Y}}<br><b>{CURRENCY}%{{y:,.0f}}</b><extra>Cartera</extra>",
     ))
     fig.add_trace(go.Scatter(
         x=selected.index, y=selected["S&P 500"], name="S&P 500 (SPY)", mode="lines",
-        line=dict(color="#e07a3f", width=2.3),
+        line=dict(color="#e07a3f", width=2.6),
         hovertemplate=f"%{{x|%d/%m/%Y}}<br><b>{CURRENCY}%{{y:,.0f}}</b><extra>S&P 500</extra>",
     ))
-    common_layout(fig, 570, f"Valor de la cartera · {period_label} · Última sesión: {selected.index[-1]:%d/%m/%Y}")
+    common_layout(fig, 555, f"Valor de la cartera · {period_label} · Última sesión: {selected.index[-1]:%d/%m/%Y}")
     fig.update_yaxes(title="Valor de la cartera", tickprefix=CURRENCY, tickformat=",.0f", gridcolor="#dbe3eb", automargin=True)
     st.plotly_chart(fig, width="stretch", config={"displaylogo":False, "displayModeBar":False, "responsive":True})
 
+    initial_period_value = selected["Cartera"].iloc[0]
+    current_period_value = selected["Cartera"].iloc[-1]
+    period_result = current_period_value - initial_period_value
     st.markdown('<div class="section">Situación actual</div>', unsafe_allow_html=True)
-    initial_period_value = selected["Cartera sin cobertura"].iloc[0]
-    current_long = selected["Cartera sin cobertura"].iloc[-1]
-    current_hedged = selected["Cartera con cobertura"].iloc[-1]
-    p1, p2, p3, p4 = st.columns(4)
+    p1, p2, p3 = st.columns(3)
     p1.metric(f"Cantidad inicial {period_label}", money(initial_period_value))
-    p2.metric("Actual sin cobertura", money(current_long))
-    p3.metric("Actual con cobertura", money(current_hedged))
-    p4.metric("P&L cobertura", money(hedge_details["pnl"], signed=True))
+    p2.metric(f"Cantidad final {period_label}", money(current_period_value))
+    p3.metric(f"Ganancia / pérdida {period_label}", money(period_result, signed=True))
 
-    st.markdown('<div class="section">Rentabilidad y riesgo</div>', unsafe_allow_html=True)
-    r1, r2, r3 = st.columns(3)
-    with r1:
-        st.markdown("**Cartera sin cobertura**")
-        a, b, c = st.columns(3)
-        a.metric("Rentabilidad", pct(long_stats["return"]))
-        b.metric("Drawdown", pct(long_stats["dd"]))
-        c.metric("Rent./DD", ratio(long_stats["ratio"]))
-    with r2:
-        st.markdown(f"**Cartera con cobertura ×{hedge_multiplier:g}**")
-        a, b, c = st.columns(3)
-        a.metric("Rentabilidad", pct(hedge_stats["return"]))
-        b.metric("Drawdown", pct(hedge_stats["dd"]))
-        c.metric("Rent./DD", ratio(hedge_stats["ratio"]))
-    with r3:
-        st.markdown("**S&P 500**")
-        a, b, c = st.columns(3)
-        a.metric("Rentabilidad", pct(spy_stats["return"]))
-        b.metric("Drawdown", pct(spy_stats["dd"]))
-        c.metric("Rent./DD", ratio(spy_stats["ratio"]))
+    st.markdown('<div class="section">Cartera</div>', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"Rentabilidad {period_label}", pct(portfolio_stats["return"]), delta=f'{portfolio_stats["return"] - benchmark_stats["return"]:+.2%} vs S&P 500')
+    c2.metric("Drawdown máximo", pct(portfolio_stats["dd"]))
+    c3.metric("Rentabilidad / drawdown", ratio(portfolio_stats["ratio"]))
+
+    st.markdown('<div class="section">S&P 500</div>', unsafe_allow_html=True)
+    s1, s2, s3 = st.columns(3)
+    s1.metric(f"Rentabilidad {period_label}", pct(benchmark_stats["return"]))
+    s2.metric("Drawdown máximo", pct(benchmark_stats["dd"]))
+    s3.metric("Rentabilidad / drawdown", ratio(benchmark_stats["ratio"]))
 
     dd_fig = go.Figure()
     dd_fig.add_trace(go.Scatter(
-        x=drawdown.index, y=drawdown["Cartera sin cobertura"] * 100,
-        name="Sin cobertura", mode="lines",
-        line=dict(color="#087f8c", width=2.6),
-        hovertemplate="%{x|%d/%m/%Y}<br><b>%{y:.2f}%</b><extra>Sin cobertura</extra>",
+        x=drawdown.index, y=drawdown["Cartera"] * 100, name="Drawdown cartera",
+        mode="lines", line=dict(color="#8b1e3f", width=2.6), fill="tozeroy",
+        fillcolor="rgba(139,30,63,.16)",
+        hovertemplate="%{x|%d/%m/%Y}<br><b>%{y:.2f}%</b><extra>Cartera</extra>",
     ))
     dd_fig.add_trace(go.Scatter(
-        x=drawdown.index, y=drawdown["Cartera con cobertura"] * 100,
-        name=f"Con cobertura ×{hedge_multiplier:g}", mode="lines",
-        line=dict(color="#8b1e3f", width=2.8), fill="tozeroy",
-        fillcolor="rgba(139,30,63,.12)",
-        hovertemplate="%{x|%d/%m/%Y}<br><b>%{y:.2f}%</b><extra>Con cobertura</extra>",
-    ))
-    dd_fig.add_trace(go.Scatter(
-        x=drawdown.index, y=drawdown["S&P 500"] * 100,
-        name="S&P 500", mode="lines",
-        line=dict(color="#e07a3f", width=2.1),
+        x=drawdown.index, y=drawdown["S&P 500"] * 100, name="Drawdown S&P 500",
+        mode="lines", line=dict(color="#e07a3f", width=2.2),
         hovertemplate="%{x|%d/%m/%Y}<br><b>%{y:.2f}%</b><extra>S&P 500</extra>",
     ))
     dd_fig.add_hline(y=0, line_width=1, line_color="#94a3b8")
-    common_layout(dd_fig, 430, f"Curva de drawdown · {period_label}")
+    common_layout(dd_fig, 420, f"Curva de drawdown · {period_label}")
     dd_fig.update_yaxes(title="Drawdown", ticksuffix="%", gridcolor="#dbe3eb", rangemode="tozero")
     st.plotly_chart(dd_fig, width="stretch", config={"displaylogo":False, "displayModeBar":False, "responsive":True})
 
-    long_beta, long_alpha = beta_alpha(selected["Cartera sin cobertura"], selected["S&P 500"])
-    hedged_beta, hedged_alpha = beta_alpha(selected["Cartera con cobertura"], selected["S&P 500"])
-    qqq_beta, qqq_alpha = beta_alpha(selected["Nasdaq 100"], selected["S&P 500"])
-
-    st.markdown('<div class="section">Beta y alpha anualizada frente al S&P 500</div>', unsafe_allow_html=True)
-    b1, b2, b3, b4 = st.columns(4)
-    b1.metric("Beta cartera", beta_text(long_beta), delta=f"Alpha {pct(long_alpha)}", delta_color="off")
-    b2.metric("Beta cartera cubierta", beta_text(hedged_beta), delta=f"Alpha {pct(hedged_alpha)}", delta_color="off")
-    b3.metric("Beta S&P 500", "1.00", delta="Alpha +0.00%", delta_color="off")
-    b4.metric("Beta Nasdaq 100", beta_text(qqq_beta), delta=f"Alpha {pct(qqq_alpha)}", delta_color="off")
-
-    st.markdown('<div class="section">Detalles de la cobertura</div>', unsafe_allow_html=True)
-    h1, h2, h3, h4 = st.columns(4)
-    h1.metric("Apertura", hedge_details["session"].strftime("%d/%m/%Y"))
-    h2.metric("Valor cartera al abrir", money(hedge_details["base_value"]))
-    h3.metric("Notional corto QQQ", money(hedge_details["notional"]))
-    h4.metric("Resultado cobertura", money(hedge_details["pnl"], signed=True))
-
     year_start = pd.Timestamp(today.year, 1, 1)
-    history = long_trades[(long_trades["BUY DATE"] >= year_start) & (long_trades["BUY DATE"] <= today)].copy()
+    history = trades[(trades["BUY DATE"] >= year_start) & (trades["BUY DATE"] <= today)].copy()
     history = history.merge(ledger, how="left", left_on="TRADE ID", right_index=True)
     history["ESTADO"] = np.where(history["SELL DATE"].notna() & (history["SELL DATE"] <= today), "Cerrada", "Abierta")
-    history["TIPO"] = "Inversión"
     history["FINAL"] = history["SELL DATE"].where(history["ESTADO"].eq("Cerrada"), today)
     history["DURACION"] = (history["FINAL"] - history["BUY DATE"]).dt.days
     history["RENTABILIDAD"] = history["P&L MONEY"] / history["ENTRY VALUE"]
-
-    hedge_history = pd.DataFrame([{
-        "TICKER": HEDGE_TICKER,
-        "COMPANY": "Cobertura Nasdaq 100",
-        "GICS SECTOR": "Cobertura",
-        "GICS SUB-INDUSTRY": "Posición corta",
-        "BUY DATE": hedge_details["session"],
-        "SELL DATE": pd.NaT,
-        "ESTADO": "Abierta",
-        "TIPO": f"Cobertura corta ×{hedge_multiplier:g}",
-        "DURACION": (today - hedge_details["session"]).days,
-        "ENTRY VALUE": hedge_details["notional"],
-        "CURRENT VALUE": hedge_details["current_liability"],
-        "P&L MONEY": hedge_details["pnl"],
-        "RENTABILIDAD": hedge_details["return"],
-    }])
-    history = pd.concat([history, hedge_history], ignore_index=True, sort=False)
     open_count = int(history["ESTADO"].eq("Abierta").sum())
     closed_count = int(history["ESTADO"].eq("Cerrada").sum())
 
     st.subheader(f"Histórico de operaciones {today.year}")
-    st.caption(f"{len(history)} operaciones · {open_count} abiertas · {closed_count} cerradas · incluye la cobertura")
+    st.caption(f"{len(history)} operaciones desde el 1 de enero · {open_count} abiertas · {closed_count} cerradas")
     wanted = [
-        "TIPO", "TICKER", "COMPANY", "GICS SECTOR", "GICS INDUSTRY", "GICS SUB-INDUSTRY",
+        "TICKER", "COMPANY", "GICS SECTOR", "GICS INDUSTRY", "GICS SUB-INDUSTRY",
         "BUY DATE", "SELL DATE", "ESTADO", "DURACION", "ENTRY VALUE",
         "CURRENT VALUE", "P&L MONEY", "RENTABILIDAD",
     ]
     operations = history[[column for column in wanted if column in history.columns]].copy()
     operations["ORDEN ESTADO"] = operations["ESTADO"].map({"Abierta":0, "Cerrada":1})
     operations = operations.sort_values(["ORDEN ESTADO", "BUY DATE", "TICKER"], ascending=[True, False, True]).drop(columns="ORDEN ESTADO")
-    operations["BUY DATE"] = pd.to_datetime(operations["BUY DATE"]).dt.strftime("%d/%m/%Y")
-    operations["SELL DATE"] = pd.to_datetime(operations["SELL DATE"]).dt.strftime("%d/%m/%Y").fillna("-")
+    operations["BUY DATE"] = operations["BUY DATE"].dt.strftime("%d/%m/%Y")
+    operations["SELL DATE"] = operations["SELL DATE"].dt.strftime("%d/%m/%Y").fillna("-")
     operations["ESTADO"] = operations["ESTADO"].map({"Abierta":"🟢 Abierta", "Cerrada":"🔴 Cerrada"})
     operations = operations.rename(columns={
-        "TIPO":"Tipo", "TICKER":"Ticker", "COMPANY":"Compañía",
-        "GICS SECTOR":"Sector GICS", "GICS INDUSTRY":"Industria GICS",
-        "GICS SUB-INDUSTRY":"Subindustria GICS", "BUY DATE":"Fecha de compra",
-        "SELL DATE":"Fecha de cierre", "ESTADO":"Estado", "DURACION":"Duración (días)",
-        "ENTRY VALUE":"Importe inicial", "CURRENT VALUE":"Importe final/actual",
-        "P&L MONEY":"Ganancia / pérdida", "RENTABILIDAD":"Rentabilidad",
+        "TICKER":"Ticker", "COMPANY":"Compañía", "GICS SECTOR":"Sector GICS",
+        "GICS INDUSTRY":"Industria GICS", "GICS SUB-INDUSTRY":"Subindustria GICS",
+        "BUY DATE":"Fecha de compra", "SELL DATE":"Fecha de cierre", "ESTADO":"Estado",
+        "DURACION":"Duración (días)", "ENTRY VALUE":"Importe inicial",
+        "CURRENT VALUE":"Importe final/actual", "P&L MONEY":"Ganancia / pérdida",
+        "RENTABILIDAD":"Rentabilidad",
     })
 
     def pnl_style(value):
@@ -579,10 +458,9 @@ try:
     st.dataframe(styled, width="stretch", hide_index=True)
 
     st.caption(
-        "La cobertura se modela como una posición corta fija en QQQ, abierta en la primera sesión "
-        "disponible desde la fecha indicada en el Excel. El notional inicial es el valor total de "
-        "la cartera en esa sesión multiplicado por el factor seleccionado. No se rebalancea después. "
-        "No se incluyen comisiones, financiación, dividendos debitados ni impuestos."
+        "Simulación monetaria sin rebalanceo diario. En cada cambio mensual, el importe "
+        "de las ventas se distribuye por igual entre las compras de la misma fecha. "
+        "Se permiten acciones fraccionarias y no se incluyen comisiones ni impuestos."
     )
 
 except Exception as exc:

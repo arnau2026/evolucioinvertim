@@ -8,8 +8,13 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
+# =========================
+# CONFIGURACION
+# =========================
 FILE = Path(__file__).with_name("USAstocks.xlsx")
 BENCHMARK = "SPY"
+INITIAL_CAPITAL = 100_000.0
+CURRENCY = "$"
 TZ = ZoneInfo("Europe/Madrid")
 PERIODS = {
     "1S": pd.DateOffset(weeks=1),
@@ -80,7 +85,7 @@ div[role="radiogroup"] label:has(input:checked) span {
 
 def load_trades(path):
     df = pd.read_excel(path, engine="openpyxl")
-    df.columns = [str(c).strip().upper() for c in df.columns]
+    df.columns = [str(column).strip().upper() for column in df.columns]
     missing = {"TICKER", "BUY DATE", "SELL DATE"} - set(df.columns)
     if missing:
         raise ValueError("Faltan columnas: " + ", ".join(sorted(missing)))
@@ -95,7 +100,8 @@ def load_trades(path):
 
     if df.empty:
         raise ValueError("El Excel no contiene operaciones válidas.")
-    if (df["SELL DATE"].notna() & (df["SELL DATE"] < df["BUY DATE"])).any():
+    invalid = df["SELL DATE"].notna() & (df["SELL DATE"] < df["BUY DATE"])
+    if invalid.any():
         raise ValueError("Hay alguna fecha de venta anterior a la compra.")
     return df.sort_values(["BUY DATE", "TICKER"]).reset_index(drop=True)
 
@@ -103,8 +109,13 @@ def load_trades(path):
 @st.cache_data(ttl=55, show_spinner=False)
 def get_prices(tickers, start, end):
     raw = yf.download(
-        list(tickers), start=start, end=end, auto_adjust=True,
-        progress=False, threads=True, timeout=20,
+        list(tickers),
+        start=start,
+        end=end,
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+        timeout=20,
     )
     if raw.empty:
         return pd.DataFrame()
@@ -118,27 +129,120 @@ def get_prices(tickers, start, end):
     return prices.sort_index().dropna(how="all")
 
 
-def build_returns(trades, prices, start, today):
-    tickers = [column for column in prices.columns if column != BENCHMARK]
-    returns = prices[tickers].ffill().pct_change(fill_method=None)
-    returns = returns.replace([np.inf, -np.inf], np.nan)
-    active = pd.DataFrame(False, index=returns.index, columns=tickers)
+def next_session(date, sessions):
+    candidates = sessions[sessions >= pd.Timestamp(date)]
+    return candidates[0] if len(candidates) else pd.NaT
 
-    for _, trade in trades.iterrows():
-        ticker = trade["TICKER"]
-        if ticker not in active.columns:
-            continue
-        sell = today if pd.isna(trade["SELL DATE"]) else min(trade["SELL DATE"], today)
-        active.loc[(active.index > trade["BUY DATE"]) & (active.index <= sell), ticker] = True
 
-    valid = active & returns.notna()
-    count = valid.sum(axis=1)
-    portfolio = returns.where(valid).sum(axis=1).div(count.replace(0, np.nan)).fillna(0)
-    spy = prices[BENCHMARK].ffill().pct_change(fill_method=None).fillna(0)
-    daily = pd.concat(
-        [portfolio.rename("Cartera"), spy.rename("S&P 500")], axis=1
-    ).loc[start:today]
-    return daily
+def prepare_events(trades, sessions):
+    """Convierte fechas del Excel en sesiones reales de mercado."""
+    prepared = trades.copy()
+    prepared["BUY SESSION"] = prepared["BUY DATE"].map(lambda value: next_session(value, sessions))
+    prepared["SELL SESSION"] = prepared["SELL DATE"].map(
+        lambda value: pd.NaT if pd.isna(value) else next_session(value, sessions)
+    )
+    return prepared
+
+
+def build_money_portfolio(trades, prices, initial_capital):
+    """
+    Simulacion monetaria sin rebalanceo diario.
+
+    - En la primera fecha de compra, todo el capital inicial se reparte por igual.
+    - En fechas posteriores, primero se venden las posiciones señaladas.
+    - Los ingresos de esas ventas se reparten por igual entre las compras de esa fecha.
+    - Las posiciones que continúan abiertas conservan sus acciones y no se rebalancean.
+    - Los posibles importes no invertidos permanecen en efectivo.
+    - Se permiten acciones fraccionarias para repartir exactamente el importe disponible.
+    """
+    sessions = prices.index
+    events = prepare_events(trades, sessions)
+    event_dates = sorted(
+        set(events["BUY SESSION"].dropna().tolist())
+        | set(events["SELL SESSION"].dropna().tolist())
+    )
+    if not event_dates:
+        raise ValueError("No se han encontrado fechas de operación válidas.")
+
+    first_event = event_dates[0]
+    holdings = {}  # ticker -> numero de acciones
+    cash = float(initial_capital)
+    records = []
+    trade_log = []
+
+    for date in sessions[sessions >= first_event]:
+        prices_today = prices.loc[date]
+        if date in event_dates:
+            sales = events[events["SELL SESSION"] == date]
+            purchases = events[events["BUY SESSION"] == date]
+
+            sale_proceeds = 0.0
+            for _, trade in sales.iterrows():
+                ticker = trade["TICKER"]
+                shares = holdings.pop(ticker, 0.0)
+                price = prices_today.get(ticker, np.nan)
+                if shares > 0 and pd.notna(price):
+                    proceeds = shares * price
+                    sale_proceeds += proceeds
+                    cash += proceeds
+                    trade_log.append({
+                        "Fecha": date,
+                        "Tipo": "Venta",
+                        "Ticker": ticker,
+                        "Importe": proceeds,
+                    })
+
+            valid_buys = []
+            for _, trade in purchases.iterrows():
+                ticker = trade["TICKER"]
+                price = prices_today.get(ticker, np.nan)
+                if pd.notna(price) and price > 0:
+                    valid_buys.append(ticker)
+
+            if valid_buys:
+                if date == first_event:
+                    investment_pool = cash
+                else:
+                    investment_pool = min(sale_proceeds, cash)
+
+                amount_per_ticker = investment_pool / len(valid_buys)
+                for ticker in valid_buys:
+                    price = prices_today[ticker]
+                    shares = amount_per_ticker / price
+                    holdings[ticker] = holdings.get(ticker, 0.0) + shares
+                    cash -= amount_per_ticker
+                    trade_log.append({
+                        "Fecha": date,
+                        "Tipo": "Compra",
+                        "Ticker": ticker,
+                        "Importe": amount_per_ticker,
+                    })
+
+        invested = 0.0
+        for ticker, shares in holdings.items():
+            price = prices_today.get(ticker, np.nan)
+            if pd.notna(price):
+                invested += shares * price
+
+        records.append({
+            "Fecha": date,
+            "Patrimonio": cash + invested,
+            "Invertido": invested,
+            "Efectivo": cash,
+            "Posiciones": len(holdings),
+        })
+
+    portfolio = pd.DataFrame(records).set_index("Fecha")
+    log = pd.DataFrame(trade_log)
+    return portfolio, events, log
+
+
+def build_benchmark(prices, start_date, initial_capital):
+    benchmark = prices[BENCHMARK].dropna().loc[start_date:]
+    if benchmark.empty:
+        raise ValueError("No hay precios del S&P 500 para el periodo calculado.")
+    shares = initial_capital / benchmark.iloc[0]
+    return benchmark * shares
 
 
 def period_start(period, today):
@@ -147,39 +251,41 @@ def period_start(period, today):
     return (today - PERIODS[period]).normalize()
 
 
+def normalize_period(values, start):
+    selected = values.loc[values.index >= start].copy()
+    if selected.empty:
+        raise ValueError("No hay sesiones en el periodo seleccionado.")
+    return selected / selected.iloc[0] - 1
+
+
+def calculate_stats(values, start):
+    selected = values.loc[values.index >= start].copy()
+    if selected.empty:
+        return {"return": np.nan, "dd": np.nan, "ratio": np.nan}
+    normalized = selected / selected.iloc[0]
+    total_return = normalized.iloc[-1] - 1
+    drawdown = normalized / normalized.cummax() - 1
+    max_drawdown = drawdown.min()
+    return {
+        "return": total_return,
+        "dd": max_drawdown,
+        "ratio": total_return / abs(max_drawdown) if max_drawdown < 0 else np.nan,
+    }
+
+
 def operation_return(row, prices, today):
     ticker = row["TICKER"]
     if ticker not in prices.columns:
         return np.nan
     series = prices[ticker].dropna()
-    if series.empty:
-        return np.nan
-
     buy_candidates = series.loc[series.index >= row["BUY DATE"]]
     if buy_candidates.empty:
         return np.nan
-    buy_price = buy_candidates.iloc[0]
-
     end_date = today if pd.isna(row["SELL DATE"]) or row["SELL DATE"] > today else row["SELL DATE"]
     sell_candidates = series.loc[series.index <= end_date]
-    if sell_candidates.empty or buy_price <= 0:
+    if sell_candidates.empty or buy_candidates.iloc[0] <= 0:
         return np.nan
-    return sell_candidates.iloc[-1] / buy_price - 1
-
-
-def stats_for(daily):
-    result = {}
-    for column in daily.columns:
-        growth = (1 + daily[column]).cumprod()
-        drawdown = growth / growth.cummax() - 1
-        total_return = growth.iloc[-1] - 1
-        max_drawdown = drawdown.min()
-        result[column] = {
-            "return": total_return,
-            "dd": max_drawdown,
-            "ratio": total_return / abs(max_drawdown) if max_drawdown < 0 else np.nan,
-        }
-    return result
+    return sell_candidates.iloc[-1] / buy_candidates.iloc[0] - 1
 
 
 def pct(value):
@@ -188,6 +294,10 @@ def pct(value):
 
 def ratio(value):
     return "N/D" if pd.isna(value) or np.isinf(value) else f"{value:.2f}x"
+
+
+def money(value):
+    return f"{CURRENCY}{value:,.0f}"
 
 
 def common_layout(fig, height, title):
@@ -199,16 +309,23 @@ def common_layout(fig, height, title):
         plot_bgcolor="#f8fafc",
         font=dict(color="#334155", size=13),
         xaxis=dict(
-            showgrid=False, linecolor="#94a3b8",
-            tickfont=dict(color="#334155", size=12), automargin=True,
+            showgrid=False,
+            linecolor="#94a3b8",
+            tickfont=dict(color="#334155", size=12),
+            automargin=True,
         ),
         legend=dict(
-            orientation="h", yanchor="bottom", y=1.02,
-            xanchor="right", x=1, font=dict(color="#334155", size=12),
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            font=dict(color="#334155", size=12),
             bgcolor="rgba(255,255,255,0.85)",
         ),
         hoverlabel=dict(
-            bgcolor="#111827", bordercolor="#111827",
+            bgcolor="#111827",
+            bordercolor="#111827",
             font=dict(color="#ffffff", size=13),
         ),
         hovermode="x unified",
@@ -225,17 +342,11 @@ if not FILE.exists():
 
 try:
     trades = load_trades(FILE)
-    calculation_start = min(
-        pd.Timestamp(today.year, 1, 1),
-        today - pd.DateOffset(months=6),
-        trades["BUY DATE"].min(),
-    )
+    download_start = (trades["BUY DATE"].min() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    download_end = (today + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
     tickers = tuple(sorted(set(trades["TICKER"]) | {BENCHMARK}))
-    prices = get_prices(
-        tickers,
-        (calculation_start - pd.Timedelta(days=10)).strftime("%Y-%m-%d"),
-        (today + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
-    )
+    prices = get_prices(tickers, download_start, download_end)
+
     if prices.empty or BENCHMARK not in prices.columns:
         st.error("No se han podido descargar los precios.")
         st.stop()
@@ -243,75 +354,95 @@ try:
     missing = sorted(set(trades["TICKER"]) - set(prices.columns))
     if missing:
         st.warning("Sin precios para: " + ", ".join(missing))
-        trades = trades[~trades["TICKER"].isin(missing)]
+        trades = trades[~trades["TICKER"].isin(missing)].copy()
 
-    daily_all = build_returns(trades, prices, calculation_start, today)
+    portfolio, prepared_trades, transaction_log = build_money_portfolio(
+        trades, prices, INITIAL_CAPITAL
+    )
+    benchmark = build_benchmark(prices, portfolio.index[0], INITIAL_CAPITAL)
+    equity = pd.concat(
+        [portfolio["Patrimonio"].rename("Cartera"), benchmark.rename("S&P 500")],
+        axis=1,
+    ).ffill().dropna()
 
     period_col, spacer_col, refresh_col = st.columns([5.0, 3.5, 1.5], vertical_alignment="center")
     with period_col:
         period = st.radio(
-            "Periodo", ["1S", "1M", "3M", "6M", "YTD"],
-            index=4, horizontal=True, label_visibility="collapsed",
+            "Periodo",
+            ["1S", "1M", "3M", "6M", "YTD"],
+            index=4,
+            horizontal=True,
+            label_visibility="collapsed",
         )
     with refresh_col:
         if st.button("↻ Actualizar", type="primary", width="stretch"):
             st.cache_data.clear()
             st.rerun()
 
-    daily = daily_all.loc[daily_all.index >= period_start(period, today)].copy()
-    if daily.empty:
-        raise ValueError("No hay sesiones en el periodo seleccionado.")
-
-    growth = (1 + daily).cumprod()
-    curve = growth * 100 - 100
-    drawdown_curve = (growth / growth.cummax() - 1) * 100
-    stats = stats_for(daily)
+    start = period_start(period, today)
+    normalized = normalize_period(equity, start)
+    curve = normalized * 100
+    drawdown = (1 + normalized) / (1 + normalized).cummax() - 1
+    drawdown_pct = drawdown * 100
+    portfolio_stats = calculate_stats(equity["Cartera"], start)
+    benchmark_stats = calculate_stats(equity["S&P 500"], start)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=curve.index, y=curve["Cartera"], name="Cartera", mode="lines",
+        x=curve.index,
+        y=curve["Cartera"],
+        name="Cartera",
+        mode="lines",
         line=dict(color="#087f8c", width=3),
         hovertemplate="%{x|%d/%m/%Y}<br><b>%{y:.2f}%</b><extra>Cartera</extra>",
     ))
     fig.add_trace(go.Scatter(
-        x=curve.index, y=curve["S&P 500"], name="S&P 500 (SPY)", mode="lines",
+        x=curve.index,
+        y=curve["S&P 500"],
+        name="S&P 500 (SPY)",
+        mode="lines",
         line=dict(color="#e07a3f", width=2.6),
         hovertemplate="%{x|%d/%m/%Y}<br><b>%{y:.2f}%</b><extra>S&P 500</extra>",
     ))
     fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="#9aa8b6")
     common_layout(
-        fig, 555,
+        fig,
+        555,
         f"Rentabilidad acumulada {period} · Última sesión: {curve.index[-1]:%d/%m/%Y}",
     )
     fig.update_yaxes(
-        title=dict(text="Rentabilidad acumulada", font=dict(color="#334155", size=13)),
-        ticksuffix="%", gridcolor="#dbe3eb", linecolor="#94a3b8",
-        tickfont=dict(color="#334155", size=12), automargin=True,
+        title="Rentabilidad acumulada",
+        ticksuffix="%",
+        gridcolor="#dbe3eb",
+        tickfont=dict(color="#334155", size=12),
+        automargin=True,
     )
     st.plotly_chart(
-        fig, width="stretch",
+        fig,
+        width="stretch",
         config={"displaylogo": False, "displayModeBar": False, "responsive": True},
     )
 
     st.markdown('<div class="section">Cartera</div>', unsafe_allow_html=True)
     c1, c2, c3 = st.columns(3)
     c1.metric(
-        f"Rentabilidad {period}", pct(stats["Cartera"]["return"]),
-        delta=f'{stats["Cartera"]["return"] - stats["S&P 500"]["return"]:+.2%} vs S&P 500',
+        f"Rentabilidad {period}",
+        pct(portfolio_stats["return"]),
+        delta=f'{portfolio_stats["return"] - benchmark_stats["return"]:+.2%} vs S&P 500',
     )
-    c2.metric("Drawdown máximo", pct(stats["Cartera"]["dd"]))
-    c3.metric("Rentabilidad / drawdown", ratio(stats["Cartera"]["ratio"]))
+    c2.metric("Drawdown máximo", pct(portfolio_stats["dd"]))
+    c3.metric("Rentabilidad / drawdown", ratio(portfolio_stats["ratio"]))
 
     st.markdown('<div class="section">S&P 500</div>', unsafe_allow_html=True)
     s1, s2, s3 = st.columns(3)
-    s1.metric(f"Rentabilidad {period}", pct(stats["S&P 500"]["return"]))
-    s2.metric("Drawdown máximo", pct(stats["S&P 500"]["dd"]))
-    s3.metric("Rentabilidad / drawdown", ratio(stats["S&P 500"]["ratio"]))
+    s1.metric(f"Rentabilidad {period}", pct(benchmark_stats["return"]))
+    s2.metric("Drawdown máximo", pct(benchmark_stats["dd"]))
+    s3.metric("Rentabilidad / drawdown", ratio(benchmark_stats["ratio"]))
 
     dd_fig = go.Figure()
     dd_fig.add_trace(go.Scatter(
-        x=drawdown_curve.index,
-        y=drawdown_curve["Cartera"],
+        x=drawdown_pct.index,
+        y=drawdown_pct["Cartera"],
         name="Drawdown cartera",
         mode="lines",
         line=dict(color="#8b1e3f", width=2.6),
@@ -320,8 +451,8 @@ try:
         hovertemplate="%{x|%d/%m/%Y}<br><b>%{y:.2f}%</b><extra>Cartera</extra>",
     ))
     dd_fig.add_trace(go.Scatter(
-        x=drawdown_curve.index,
-        y=drawdown_curve["S&P 500"],
+        x=drawdown_pct.index,
+        y=drawdown_pct["S&P 500"],
         name="Drawdown S&P 500",
         mode="lines",
         line=dict(color="#e07a3f", width=2.2),
@@ -330,21 +461,31 @@ try:
     dd_fig.add_hline(y=0, line_width=1, line_color="#94a3b8")
     common_layout(dd_fig, 420, f"Curva de drawdown {period}")
     dd_fig.update_yaxes(
-        title=dict(text="Drawdown", font=dict(color="#334155", size=13)),
-        ticksuffix="%", gridcolor="#dbe3eb", linecolor="#94a3b8",
-        tickfont=dict(color="#334155", size=12), automargin=True,
+        title="Drawdown",
+        ticksuffix="%",
+        gridcolor="#dbe3eb",
+        tickfont=dict(color="#334155", size=12),
+        automargin=True,
         rangemode="tozero",
     )
     st.plotly_chart(
-        dd_fig, width="stretch",
+        dd_fig,
+        width="stretch",
         config={"displaylogo": False, "displayModeBar": False, "responsive": True},
     )
+
+    st.markdown('<div class="section">Situación actual</div>', unsafe_allow_html=True)
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Patrimonio actual", money(portfolio["Patrimonio"].iloc[-1]))
+    p2.metric("Capital invertido", money(portfolio["Invertido"].iloc[-1]))
+    p3.metric("Efectivo", money(portfolio["Efectivo"].iloc[-1]))
 
     year_start = pd.Timestamp(today.year, 1, 1)
     history = trades[(trades["BUY DATE"] >= year_start) & (trades["BUY DATE"] <= today)].copy()
     history["ESTADO"] = np.where(
         history["SELL DATE"].notna() & (history["SELL DATE"] <= today),
-        "Cerrada", "Abierta",
+        "Cerrada",
+        "Abierta",
     )
     history["FINAL"] = history["SELL DATE"].where(history["ESTADO"].eq("Cerrada"), today)
     history["DURACION"] = (history["FINAL"] - history["BUY DATE"]).dt.days
@@ -359,25 +500,31 @@ try:
     )
     wanted = [
         "TICKER", "COMPANY", "GICS SECTOR", "GICS INDUSTRY",
-        "GICS SUB-INDUSTRY", "BUY DATE", "SELL DATE", "ESTADO",
-        "DURACION", "RENTABILIDAD",
+        "GICS SUB-INDUSTRY", "BUY DATE", "SELL DATE",
+        "ESTADO", "DURACION", "RENTABILIDAD",
     ]
     operations = history[[column for column in wanted if column in history.columns]].copy()
     operations["ORDEN ESTADO"] = operations["ESTADO"].map({"Abierta": 0, "Cerrada": 1})
     operations = operations.sort_values(
-        ["ORDEN ESTADO", "BUY DATE", "TICKER"], ascending=[True, False, True]
+        ["ORDEN ESTADO", "BUY DATE", "TICKER"],
+        ascending=[True, False, True],
     ).drop(columns="ORDEN ESTADO")
     operations["BUY DATE"] = operations["BUY DATE"].dt.strftime("%d/%m/%Y")
     operations["SELL DATE"] = operations["SELL DATE"].dt.strftime("%d/%m/%Y").fillna("-")
     operations["ESTADO"] = operations["ESTADO"].map({
-        "Abierta": "🟢 Abierta", "Cerrada": "🔴 Cerrada"
+        "Abierta": "🟢 Abierta",
+        "Cerrada": "🔴 Cerrada",
     })
     operations = operations.rename(columns={
-        "TICKER": "Ticker", "COMPANY": "Compañía",
-        "GICS SECTOR": "Sector GICS", "GICS INDUSTRY": "Industria GICS",
+        "TICKER": "Ticker",
+        "COMPANY": "Compañía",
+        "GICS SECTOR": "Sector GICS",
+        "GICS INDUSTRY": "Industria GICS",
         "GICS SUB-INDUSTRY": "Subindustria GICS",
-        "BUY DATE": "Fecha de compra", "SELL DATE": "Fecha de cierre",
-        "ESTADO": "Estado", "DURACION": "Duración (días)",
+        "BUY DATE": "Fecha de compra",
+        "SELL DATE": "Fecha de cierre",
+        "ESTADO": "Estado",
+        "DURACION": "Duración (días)",
         "RENTABILIDAD": "Rentabilidad",
     })
 
@@ -401,8 +548,9 @@ try:
     st.dataframe(styled_operations, width="stretch", hide_index=True)
 
     st.caption(
-        "Cartera equiponderada y rebalanceada diariamente entre posiciones activas. "
-        "Precios ajustados por dividendos y splits."
+        f"Simulación con capital inicial de {money(INITIAL_CAPITAL)}, sin rebalanceo diario. "
+        "En cada cambio mensual, el importe de las ventas se distribuye por igual "
+        "entre las nuevas compras de esa fecha. Se permiten acciones fraccionarias."
     )
 
 except Exception as exc:

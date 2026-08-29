@@ -471,7 +471,7 @@ try:
 
     st.markdown('<div class="section">Cartera</div>', unsafe_allow_html=True)
     a, b, c = st.columns(3)
-    a.metric(f"Rentabilidad {period_label}", pct(long_return), delta=f"{long_return-spy_return:+.2%} vs S&P 500")
+    a.metric(f"Rentabilidad {period_label}",pct(long_return))
     b.metric("Drawdown máximo", pct(long_drawdown))
     c.metric("Rentabilidad / drawdown", ratio(long_ratio))
     a, b, c = st.columns(3)

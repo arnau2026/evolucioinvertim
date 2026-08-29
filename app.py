@@ -10,6 +10,7 @@ import yfinance as yf
 
 FILE = Path(__file__).with_name("USAstocks.xlsx")
 SP500 = "SPY"
+NASDAQ100 = "QQQ"
 HEDGE_TICKER = "QQQ"
 DEFAULT_CAPITAL = 100_000.0
 DEFAULT_HEDGE_MULTIPLIER = 2.5
@@ -384,7 +385,7 @@ st.radio(
 
 try:
     trades, hedges = load_workbook_data(FILE)
-    tickers = tuple(sorted(set(trades["TICKER"]) | {SP500, HEDGE_TICKER}))
+    tickers = tuple(sorted(set(trades["TICKER"]) | {SP500, NASDAQ100, HEDGE_TICKER}))
     first_date = min(trades["BUY DATE"].min(), hedges["OPEN DATE"].min())
     prices = get_prices(
         tickers,
@@ -407,8 +408,11 @@ try:
     spy_equity = buy_hold(
         prices, SP500, long_equity.index[0], initial_capital
     ).rename("S&P 500")
+    nasdaq_equity = buy_hold(
+        prices, NASDAQ100, long_equity.index[0], initial_capital
+    ).rename("Nasdaq 100")
     all_equity = pd.concat(
-        [long_equity, hedged_equity, spy_equity], axis=1
+        [long_equity, hedged_equity, spy_equity, nasdaq_equity], axis=1
     ).ffill().dropna()
 
     selector = (
@@ -428,6 +432,7 @@ try:
         view["Cartera + coberturas"]
     )
     spy_return, spy_drawdown, spy_ratio = calculate_stats(view["S&P 500"])
+    nasdaq_return, nasdaq_drawdown, nasdaq_ratio = calculate_stats(view["Nasdaq 100"])
 
     # GRÁFICO PRINCIPAL: ahora incluye cartera + coberturas.
     performance_fig = go.Figure()
@@ -448,6 +453,12 @@ try:
         name="S&P 500",
         line=dict(color="#e07a3f", width=2.4),
         hovertemplate=f"%{{x|%d/%m/%Y}}<br><b>{CURRENCY}%{{y:,.0f}}</b><extra>S&P 500</extra>",
+    ))
+    performance_fig.add_trace(go.Scatter(
+        x=view.index, y=view["Nasdaq 100"],
+        name="Nasdaq 100 (QQQ)",
+        line=dict(color="#2563eb", width=2.4),
+        hovertemplate=f"%{{x|%d/%m/%Y}}<br><b>{CURRENCY}%{{y:,.0f}}</b><extra>Nasdaq 100</extra>",
     ))
     apply_layout(
         performance_fig, 560,
@@ -485,6 +496,12 @@ try:
     b.metric("Drawdown máximo", pct(spy_drawdown))
     c.metric("Rentabilidad / drawdown", ratio(spy_ratio))
 
+    st.markdown('<div class="section">Nasdaq 100</div>', unsafe_allow_html=True)
+    a, b, c = st.columns(3)
+    a.metric(f"Rentabilidad {period_label}", pct(nasdaq_return))
+    b.metric("Drawdown máximo", pct(nasdaq_drawdown))
+    c.metric("Rentabilidad / drawdown", ratio(nasdaq_ratio))
+
     # DRAWDOWN: ahora incluye explícitamente cartera + coberturas.
     drawdown = view / view.cummax() - 1
     drawdown_fig = go.Figure()
@@ -507,6 +524,12 @@ try:
         name="S&P 500",
         line=dict(color="#e07a3f", width=2.2),
         hovertemplate="%{x|%d/%m/%Y}<br><b>%{y:.2f}%</b><extra>S&P 500</extra>",
+    ))
+    drawdown_fig.add_trace(go.Scatter(
+        x=drawdown.index, y=drawdown["Nasdaq 100"] * 100,
+        name="Nasdaq 100 (QQQ)",
+        line=dict(color="#2563eb", width=2.2),
+        hovertemplate="%{x|%d/%m/%Y}<br><b>%{y:.2f}%</b><extra>Nasdaq 100</extra>",
     ))
     drawdown_fig.add_hline(y=0, line_width=1, line_color="#94a3b8")
     apply_layout(
